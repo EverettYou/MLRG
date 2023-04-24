@@ -1,4 +1,5 @@
 import torch
+device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
 ''' Meaning of dimensions
     n - size of a single G-spin (number of group elements in G)
@@ -420,37 +421,36 @@ class HMCSampler():
 
 class MLRG(torch.nn.Module):
     ''' Machine-Learning Renormalization Group'''
-    def __init__(self, invar_ten, rep, batch=16):
+    def __init__(self, invar_ten, rep, hdims=None):
         super().__init__()
         bond = Bond(invar_ten, rep)
         self.teacher =  EquivariantRBM(biadj_dat['square'], bond)
         self.student =  EquivariantRBM(biadj_dat['cross' ], bond)
-        self.moderator = RGMonotone(bond.Jdim, hdims=[8*bond.Jdim,4*bond.Jdim])
-        self.batch = batch
-        self._Jtch = None
+        if hdims is None:
+            hdims = [8*bond.Jdim,4*bond.Jdim]
+        self.moderator = RGMonotone(bond.Jdim, hdims=hdims)
 
-    def propose(self, beta=1., lamb=1., steps=1):
+    def propose(self, Jtch=None, beta=1., lamb=1., batch=128, steps=8):
         ''' propose random coupling constants J 
 
             Input:
                 beta (float or Tensor): inverse temperature. If Tensor: shape (batch,)
                 steps (int): HMC steps
         '''
-        if self._Jtch is None:
-            self._Jtch = torch.randn((self.batch, self.moderator.Jdim), device=self.moderator.device)
+        if Jtch is None:
+            Jtch = torch.randn((batch, self.moderator.Jdim), device=self.moderator.device)
         sampler = HMCSampler(energy=lambda J0: (beta * self.moderator.gradC(J0)**2+ lamb * J0**2).sum(-1))
-        self._Jtch = sampler.update(self._Jtch, steps=steps).detach()
-        return self._Jtch
+        Jtch = sampler.update(Jtch, steps=steps).detach()
+        return Jtch
 
-    def loss(self, beta=1., lamb=1., samples=512, hmcsteps=1, gibbssteps=5, cdsteps=1):
+    def loss(self, Jtch, samples=1024, gibbssteps=20, cdsteps=1):
         ''' loss function '''
-        Jtch = self.propose(beta=beta, lamb=lamb, steps=hmcsteps)
         self.teacher.set_J(Jtch)
         Jstd = self.moderator.RGforward(Jtch)
         self.student.set_J(Jstd)
         data = self.teacher.sample_tgt(samples=samples, steps=gibbssteps)
         loss = self.student.cdloss_src(data, steps=cdsteps).mean(-1)
-        return loss
+        return loss.mean(-1)
 
         
 
