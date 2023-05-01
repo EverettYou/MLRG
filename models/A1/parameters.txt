@@ -1,0 +1,10 @@
+for n in range(10):
+    mlrg = MLRG(Sn_dat[2],['A1'],[6,12,8]).to(device)
+    optimizer=torch.optim.Adam(mlrg.parameters(), lr=0.01)
+    for i in range(200):
+        optimizer.zero_grad()
+        Jtch=1.4*torch.randn(200,1).to(device)
+        loss=mlrg.loss(Jtch=Jtch, samples=1000, gibbssteps=20, cdsteps=1).mean(-1)
+        loss.backward()
+        optimizer.step()
+        torch.save(mlrg.state_dict(), str(n)+'mlrg_A1.pth')

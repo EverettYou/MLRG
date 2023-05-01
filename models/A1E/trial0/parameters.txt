@@ -1,0 +1,14 @@
+for n in range(10):
+    mlrg = MLRG(Sn_dat[2],['A1','E'],[12,24,6]).to(device)
+    mlrg.load_state_dict(torch.load("mlrg_A1E.pth", map_location=device)) # trial13, mlrg
+    optimizer=torch.optim.Adam(mlrg.parameters(), lr=0.001)
+    for i in range(20):
+        optimizer.zero_grad()
+        Jtch=[]
+        Jtch.append(f(mlrg.propose(Jtch=torch.randn(400,5).to(device),beta=10.,lamb=0.,mu=0.,steps=8), mlrg, 0))
+        Jtch.append(f(mlrg.propose(Jtch=torch.randn(600,5).to(device),beta=10.,lamb=0.,mu=0.,steps=8), mlrg, 1))
+        Jtch=torch.cat(Jtch)
+        loss=mlrg.loss(Jtch=Jtch, samples=5000, gibbssteps=50, cdsteps=5).mean(-1)
+        loss.backward()
+        optimizer.step()
+        torch.save(mlrg.state_dict(), str(n)+'mlrg_A1E.pth')
