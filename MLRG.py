@@ -1,6 +1,7 @@
 import torch
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
+
 ''' Meaning of dimensions
     n - size of a single G-spin (number of group elements in G)
     k - number of non-trivial conjugacy class in G
@@ -54,7 +55,7 @@ class Bond(torch.nn.Module):
 
     def extra_repr(self):
         return f'{self.n}, {self.rep_src} -> {self.rep_tgt}'
-    
+
     @staticmethod
     def make_rep(rep):
         if isinstance(rep, (tuple, list)):
@@ -106,13 +107,17 @@ class EquivariantRBM(torch.nn.Module):
         self.register_buffer('coupling_ten', self.get_coupling_ten()) # (L_src d_src, L_tgt d_tgt, c)
         self.clear_cache()
 
+    @property
+    def device(self):
+        return self.coupling_ten.device
+
     def extra_repr(self):
         return f'spins: {self.Ld_src} -> {self.Ld_tgt}, freedom: {self.bond.Jdim},'
 
     def get_coupling_ten(self):
         ''' Bipartite graph model coupling tensor '''
         coupling_ten = torch.einsum(self.biadj, [0,1,2], self.bond.fusion_ten, [2,3,4,5], [0,3,1,4,5]) # (L_src, d_src, L_tgt, d_tgt, c)
-        return coupling_ten.view(self.Ld_src, self.Ld_tgt, self.bond.c) # (Ld_src, Ld_tgt, c)
+        return coupling_ten.reshape(self.Ld_src, self.Ld_tgt, self.bond.c) # (Ld_src, Ld_tgt, c)
 
     def clear_cache(self):
         ''' clear cache variables '''
@@ -130,7 +135,7 @@ class EquivariantRBM(torch.nn.Module):
                  component of the coupling matrix]
         '''
         if J is None:
-            J = torch.nn.Parameter(torch.randn(self.bond.Jdim))
+            J = torch.nn.Parameter(torch.randn(self.bond.Jdim, device=self.device))
         else:
             if not isinstance(J, torch.Tensor):
                 J = torch.tensor(J)
@@ -145,7 +150,7 @@ class EquivariantRBM(torch.nn.Module):
     def J(self):
         ''' coupling constants (J) viewed as (..., c, k) '''
         return self._J.view(self._J.shape[:-1] + (self.bond.c, self.bond.k))
-    
+
     @property
     def kernel(self):
         ''' energy model kernel '''
@@ -251,7 +256,7 @@ class EquivariantRBM(torch.nn.Module):
             Output:
                 out (Tensor): spin configurations (n^Ld, Ld, n)
         '''
-        indx = torch.arange(self.bond.n) # (n, )
+        indx = torch.arange(self.bond.n, device=self.device) # (n, )
         if Ld == 1:
             indx = indx.unsqueeze(-1) # (n, 1)
         elif Ld > 1:
@@ -311,6 +316,11 @@ def Tvals(T, power=1):
     vals = torch.linalg.eigvalsh(MM).abs()
     return vals
 
+def GSD(T):
+    ''' compute ground state degeneracy '''
+    lamXi = torch.einsum(T, [...,0,1,0,1], [...])
+    lam2Xi = torch.einsum(T, [...,0,1,2,1], T, [...,2,3,0,3], [...])
+    return lamXi**2/lam2Xi
 
 class RGMonotone(torch.nn.Module):
     ''' RG Monotone network (feed-forward) 
@@ -325,7 +335,7 @@ class RGMonotone(torch.nn.Module):
         for dim_out in hdims:
             layers.append(torch.nn.Linear(dim_in, dim_out))
             layers.append(torch.nn.LayerNorm(dim_out))
-            layers.append(torch.nn.GELU())
+            layers.append(torch.nn.Tanh())
             dim_in = dim_out
         layers.append(torch.nn.Linear(dim_in, 1)) # map to a scalar
         self.ffn = torch.nn.Sequential(*layers)
@@ -385,7 +395,7 @@ class HMCSampler():
             x.requires_grad_(True)
             total_energy = self.energy(x).sum()
             grad_energy = torch.autograd.grad(total_energy, x)[0]
-        x.requires_grad_(False)
+        x.detach()
         return grad_energy
     
     def leap_frog(self, x0, p0, dt=0.01, traj_len=32):
@@ -430,7 +440,7 @@ class MLRG(torch.nn.Module):
             hdims = [8*bond.Jdim,4*bond.Jdim]
         self.moderator = RGMonotone(bond.Jdim, hdims=hdims)
 
-    def propose(self, Jtch=None, beta=1., lamb=1., batch=128, steps=8):
+    def propose(self, Jtch=None, beta=1., lamb=0., mu=0., batch=16, steps=1):
         ''' propose random coupling constants J 
 
             Input:
@@ -439,11 +449,11 @@ class MLRG(torch.nn.Module):
         '''
         if Jtch is None:
             Jtch = torch.randn((batch, self.moderator.Jdim), device=self.moderator.device)
-        sampler = HMCSampler(energy=lambda J0: (beta * self.moderator.gradC(J0)**2+ lamb * J0**2).sum(-1))
+        sampler = HMCSampler(energy=lambda J0: (beta * self.moderator.gradC(J0).norm(dim=-1) + lamb * self.moderator(J0) + mu * J0.norm(dim=-1)))
         Jtch = sampler.update(Jtch, steps=steps).detach()
         return Jtch
 
-    def loss(self, Jtch, samples=1024, gibbssteps=20, cdsteps=1):
+    def loss(self, Jtch, samples=512, gibbssteps=5, cdsteps=1):
         ''' loss function '''
         self.teacher.set_J(Jtch)
         Jstd = self.moderator.RGforward(Jtch)
