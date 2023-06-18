@@ -13,7 +13,7 @@ device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cp
 
 # Sn group non-trivial class projectors
 Sn_dat = {2: torch.tensor([[[0], [1]], [[1], [0]]], dtype=torch.float),
-          3: torch.tensor([[[0, 0], [1, 0], [1, 0], [0, 1], [0, 1], [1, 0]], [[1, 0], [0, 0], [0, 1], [1, 0], [1, 0], [0, 1]], [[1, 0], [0, 1], [0, 0], [1, 0], [1, 0], [0, 1]], [[0, 1], [1, 0], [1, 0], [0, 0], [0, 1], [1, 0]], [[0, 1], [1, 0], [1, 0], [0, 1], [0, 0], [1, 0]], [[1, 0], [0, 1], [0, 1], [1, 0], [1, 0], [0, 0]]], dtype=torch.float)}
+          3: torch.tensor([[[1, 0, 0], [0, 1, 0], [0, 1, 0], [0, 0, 1], [0, 0, 1], [0, 1, 0]], [[0, 1, 0], [1, 0, 0], [0, 0, 1], [0, 1, 0], [0, 1, 0], [0, 0, 1]], [[0, 1, 0], [0, 0, 1], [1, 0, 0], [0, 1, 0], [0, 1, 0], [0, 0, 1]], [[0, 0, 1], [0, 1, 0], [0, 1, 0], [1, 0, 0], [0, 0, 1], [0, 1, 0]], [[0, 0, 1], [0, 1, 0], [0, 1, 0], [0, 0, 1], [1, 0, 0], [0, 1, 0]], [[0, 1, 0], [0, 0, 1], [0, 0, 1], [0, 1, 0], [0, 1, 0], [1, 0, 0]]], dtype=torch.float)}
 
 # D4h group irreducible representations
 rep_dim = {'A1': 1, 'A2': 1, 'B1': 1, 'B2': 1, 'E': 2}
@@ -107,10 +107,6 @@ class EquivariantRBM(torch.nn.Module):
         self.register_buffer('coupling_ten', self.get_coupling_ten()) # (L_src d_src, L_tgt d_tgt, c)
         self.clear_cache()
 
-    @property
-    def device(self):
-        return self.coupling_ten.device
-
     def extra_repr(self):
         return f'spins: {self.Ld_src} -> {self.Ld_tgt}, freedom: {self.bond.Jdim},'
 
@@ -135,7 +131,7 @@ class EquivariantRBM(torch.nn.Module):
                  component of the coupling matrix]
         '''
         if J is None:
-            J = torch.nn.Parameter(torch.randn(self.bond.Jdim, device=self.device))
+            J = torch.nn.Parameter(torch.randn(self.bond.Jdim).to(device))
         else:
             if not isinstance(J, torch.Tensor):
                 J = torch.tensor(J)
@@ -256,7 +252,7 @@ class EquivariantRBM(torch.nn.Module):
             Output:
                 out (Tensor): spin configurations (n^Ld, Ld, n)
         '''
-        indx = torch.arange(self.bond.n, device=self.device) # (n, )
+        indx = torch.arange(self.bond.n) # (n, )
         if Ld == 1:
             indx = indx.unsqueeze(-1) # (n, 1)
         elif Ld > 1:
@@ -269,13 +265,13 @@ class EquivariantRBM(torch.nn.Module):
     def weight(self):
         ''' Boltzmann weight of all spins (WARNING: exponential complexity) '''
         if self._weight is None:
-            src = self.one_hot_configs(self.Ld_src) # (n^Ld_src, Ld_src, n)
-            tgt = self.one_hot_configs(self.Ld_tgt) # (n^Ld_tgt, Ld_tgt, n)
+            src = self.one_hot_configs(self.Ld_src).to(device) # (n^Ld_src, Ld_src, n)
+            tgt = self.one_hot_configs(self.Ld_tgt).to(device) # (n^Ld_tgt, Ld_tgt, n)
             potential_src = self.potential_src(tgt) # (..., n^Ld_tgt, Ld_src, n)
             energy = torch.einsum(src, [0,2,3], potential_src, [...,1,2,3], [...,0,1]) # (..., n^Ld_src, n^Ld_tgt)
             self._weight = torch.exp(-energy) # (..., n^Ld_src, n^Ld_tgt)
         return self._weight # (..., n^Ld_src, n^Ld_tgt)
-
+    
     def prob_src(self, split=False):
         ''' source spin configuration probabilities (WARNING: exponential complexity) 
 
@@ -300,6 +296,135 @@ class EquivariantRBM(torch.nn.Module):
             prob_tgt = prob_tgt.view(prob_tgt.shape[:-1]+(self.bond.n ** self.bond.d_tgt,) * self.L_tgt) # (..., *[n^d_tgt]*L_tgt)
         return prob_tgt
 
+    def prob_tgt_eff(self, split=False):
+        ''' target spin configuration probabilities by effective interactions between target spins (WARNING: exponential complexity) 
+
+            Input:
+                split (bool): if True, partition the probability vector into tensor by sites
+        '''
+        src = self.one_hot_configs(self.bond.d_src) # (n^(d_src), d_src, n)
+        tgt = self.one_hot_configs(self.bond.d_tgt) # (n^(d_tgt), d_tgt, n)
+        kernel = self.kernel.view(-1, self.L_src, self.bond.d_src, self.bond.n, self.L_tgt, self.bond.d_tgt, self.bond.n)
+        kernel = kernel[...,[0,1,2,3],:,:,[0,1,2,3],:,:].permute(1,0,2,3,4,5) # (..., 4, d_src, n, d_tgt, n)
+        potential_src = torch.einsum(kernel, [...,0,1,2,3,4], src, [5,1,2], [...,0,5,3,4]) # (..., 4, n^d_src, d_tgt, n)
+        energy_src_tgt = torch.einsum(tgt, [0,1,2], potential_src, [...,3,4,1,2], [...,3,4,0]) # (..., 4, n^d_src, n^d_tgt)
+        # bond color:
+        # blu -> 0
+        # red -> 1
+        # gre -> 2
+        # yel -> 3
+        energy_src_b_g = energy_src_tgt[:,0].unsqueeze(-1) + energy_src_tgt[:,2].unsqueeze(-2) # (..., n^d_src, n^d_tgt, n^d_tgt) direction: tgt -> blue -> src -> green -> tgt
+        energy_b_g = torch.exp(-energy_src_b_g).sum(-3).log() # (..., n^d_tgt, n^d_tgt) marginalize src
+        energy_src_r_y = energy_src_tgt[:,1].unsqueeze(-1) + energy_src_tgt[:,3].unsqueeze(-2) # (..., n^d_src, n^d_tgt, n^d_tgt) direction: tgt -> red -> src -> yellow -> tgt
+        energy_r_y = torch.exp(-energy_src_r_y).sum(-3).log() # (..., n^d_tgt, n^d_tgt) marginalize src
+        N = self.bond.n**self.bond.d_tgt
+        energy_tgt0tgt1 = energy_b_g.view(-1, N, N, 1, 1)                 # [tgt0, tgt1, 1, 1]
+        energy_tgt1tgt2 = energy_r_y.view(-1, 1, N, N, 1)                 # [1, tgt1, tgt2, 1]
+        energy_tgt2tgt3 = energy_b_g.permute(0,2,1).view(-1, 1, 1, N, N)  # [1, 1, tgt2, tgt3]
+        energy_tgt3tgt0 = energy_r_y.view(-1, N, 1, 1, N)                 # [tgt0, 1, 1, tgt3]
+        energy = energy_tgt0tgt1 + energy_tgt1tgt2 + energy_tgt2tgt3 + energy_tgt3tgt0 # (..., n^d_tgt, n^d_tgt, n^d_tgt, n^d_tgt)
+        prob_tgt = torch.exp(-energy)
+        prob_tgt = prob_tgt/prob_tgt.sum((1,2,3,4), keepdim=True) # (..., n^d_tgt, n^d_tgt, n^d_tgt, n^d_tgt)
+        if not split:
+            prob_tgt = prob_tgt.view(prob_tgt.shape[0], -1) # (..., n^Ld_tgt)
+        return prob_tgt
+    
+    def prob_tgt_eff2(self, split=False):
+        ''' target spin configuration probabilities by effective interactions between target spins (WARNING: exponential complexity) 
+
+            Input:
+                split (bool): if True, partition the probability vector into tensor by sites
+        '''
+        src = self.one_hot_configs(self.bond.d_src) # (n^(d_src), d_src, n)
+        tgt = self.one_hot_configs(self.bond.d_tgt) # (n^(d_tgt), d_tgt, n)
+        kernel = self.kernel.view(-1, self.L_src, self.bond.d_src, self.bond.n, self.L_tgt, self.bond.d_tgt, self.bond.n)
+        kernel = kernel[...,[0,1,2,3],:,:,[0,1,2,3],:,:].permute(1,0,2,3,4,5) # (..., 4, d_src, n, d_tgt, n)
+        potential_src = torch.einsum(kernel, [...,0,1,2,3,4], src, [5,1,2], [...,0,5,3,4]) # (..., 4, n^d_src, d_tgt, n)
+        energy_src_tgt = torch.einsum(tgt, [0,1,2], potential_src, [...,3,4,1,2], [...,3,4,0]) # (..., 4, n^d_src, n^d_tgt)
+        # bond color:
+        # blu -> 0
+        # red -> 1
+        # gre -> 2
+        # yel -> 3
+        energy_src_b_g = energy_src_tgt[:,0].unsqueeze(-1) + energy_src_tgt[:,2].unsqueeze(-2) # (..., n^d_src, n^d_tgt, n^d_tgt) direction: tgt -> blue -> src -> green -> tgt
+        energy_src_r_y = energy_src_tgt[:,1].unsqueeze(-1) + energy_src_tgt[:,3].unsqueeze(-2) # (..., n^d_src, n^d_tgt, n^d_tgt) direction: tgt -> red -> src -> yellow -> tgt
+        energy_src_src_b_g_r_y = energy_src_b_g.unsqueeze(-3).unsqueeze(-1) + energy_src_r_y.unsqueeze(-4).unsqueeze(-3) # (..., n^d_src, n^d_src, n^d_tgt, n^d_tgt, n^d_tgt) direction: tgt -> blue -> src -> green -> tgt -> red -> src -> yellow
+        energy_src_src_g_b_y_r = energy_src_b_g.permute(0,1,3,2).unsqueeze(-3).unsqueeze(-1) + energy_src_r_y.permute(0,1,3,2).unsqueeze(-4).unsqueeze(-3) # (..., n^d_src, n^d_src, n^d_tgt, n^d_tgt, n^d_tgt) direction: tgt -> green -> src -> blue -> tgt -> yellow -> src -> red
+        energy_b_g_r_y = torch.exp(-energy_src_src_b_g_r_y).sum((1, 2)).log() # (..., n^d_tgt, n^d_tgt, n^d_tgt)
+        energy_g_b_y_r = torch.exp(-energy_src_src_g_b_y_r).sum((1, 2)).log() # (..., n^d_tgt, n^d_tgt, n^d_tgt)
+        energy = energy_b_g_r_y.unsqueeze(-1) + energy_g_b_y_r.permute(0,3,1,2).unsqueeze(-3) # (..., n^d_tgt, n^d_tgt, n^d_tgt, n^d_tgt)
+        prob_tgt = torch.exp(-energy)
+        prob_tgt = prob_tgt/prob_tgt.sum((1,2,3,4), keepdim=True) # (..., n^d_tgt, n^d_tgt, n^d_tgt, n^d_tgt)
+        if not split:
+            prob_tgt = prob_tgt.view(prob_tgt.shape[0], -1) # (..., n^Ld_tgt)
+        return prob_tgt
+    
+    def prob_tgt_eff3(self, split=False):
+        ''' target spin configuration probabilities by effective interactions between target spins (WARNING: exponential complexity) 
+
+            Input:
+                split (bool): if True, partition the probability vector into tensor by sites
+        '''
+        src = self.one_hot_configs(self.bond.d_src) # (n^(d_src), d_src, n)
+        tgt = self.one_hot_configs(self.bond.d_tgt) # (n^(d_tgt), d_tgt, n)
+        kernel = self.kernel.view(-1, self.L_src, self.bond.d_src, self.bond.n, self.L_tgt, self.bond.d_tgt, self.bond.n)
+        kernel = kernel[...,[0,1,2,3],:,:,[0,1,2,3],:,:].permute(1,0,2,3,4,5) # (..., 4, d_src, n, d_tgt, n)
+        potential_src = torch.einsum(kernel, [...,0,1,2,3,4], src, [5,1,2], [...,0,5,3,4]) # (..., 4, n^d_src, d_tgt, n)
+        energy_src_tgt = torch.einsum(tgt, [0,1,2], potential_src, [...,3,4,1,2], [...,3,4,0]) # (..., 4, n^d_src, n^d_tgt)
+        # bond color:
+        # blu -> 0
+        # red -> 1
+        # gre -> 2
+        # yel -> 3
+        energy_src_b_g = energy_src_tgt[:,0].unsqueeze(-1) + energy_src_tgt[:,2].unsqueeze(-2) # (..., n^d_src, n^d_tgt, n^d_tgt) direction: tgt -> blue -> src -> green -> tgt
+        energy_src_r_y = energy_src_tgt[:,1].unsqueeze(-1) + energy_src_tgt[:,3].unsqueeze(-2) # (..., n^d_src, n^d_tgt, n^d_tgt) direction: tgt -> red -> src -> yellow -> tgt
+        energy_src_src_b_g_r_y = energy_src_b_g.unsqueeze(-3).unsqueeze(-1) + energy_src_r_y.unsqueeze(-4).unsqueeze(-3) # (..., n^d_src, n^d_src, n^d_tgt, n^d_tgt, n^d_tgt) direction: tgt -> blue -> src -> green -> tgt -> red -> src -> yellow
+        energy_src_src_g_b_y_r = energy_src_b_g.permute(0,1,3,2).unsqueeze(-3).unsqueeze(-1) + energy_src_r_y.permute(0,1,3,2).unsqueeze(-4).unsqueeze(-3) # (..., n^d_src, n^d_src, n^d_tgt, n^d_tgt, n^d_tgt) direction: tgt -> green -> src -> blue -> tgt -> yellow -> src -> red
+        N = self.bond.n**self.bond.d_tgt
+        energy = energy_src_src_b_g_r_y.view(-1, N, 1, N, 1, N, N, N, 1) + energy_src_src_g_b_y_r.permute(0,1,2,5,3,4).view(-1, 1, N, 1, N, N, 1, N, N) # (..., n^d_src, n^d_src, n^d_src, n^d_src, n^d_tgt, n^d_tgt, n^d_tgt, n^d_tgt)
+        prob_tgt = torch.exp(-energy).sum((1,2,3,4))
+        prob_tgt = prob_tgt/prob_tgt.sum((1,2,3,4), keepdim=True) # (..., n^d_tgt, n^d_tgt, n^d_tgt, n^d_tgt)
+        if not split:
+            prob_tgt = prob_tgt.view(prob_tgt.shape[0], -1) # (..., n^Ld_tgt)
+        return prob_tgt
+    
+    def prob_src_eff(self, split=False):
+        ''' source spin configuration probabilities by effective interactions between source spins (WARNING: exponential complexity) 
+
+            Input:
+                split (bool): if True, partition the probability vector into tensor by sites
+        '''
+        src = self.one_hot_configs(self.bond.d_src) # (n^(d_src), d_src, n)
+        tgt = self.one_hot_configs(self.bond.d_tgt) # (n^(d_tgt), d_tgt, n)
+        kernel = self.kernel.view(-1, self.L_src, self.bond.d_src, self.bond.n, self.L_tgt, self.bond.d_tgt, self.bond.n)
+        kernel = kernel[...,[0,1,2,3],:,:,[0,1,2,3],:,:].permute(1,0,2,3,4,5) # (..., 4, d_src, n, d_tgt, n)
+        potential_src = torch.einsum(kernel, [...,0,1,2,3,4], src, [5,1,2], [...,0,5,3,4]) # (..., 4, n^d_src, d_tgt, n)
+        energy_src_tgt = torch.einsum(tgt, [0,1,2], potential_src, [...,3,4,1,2], [...,3,4,0]) # (..., 4, n^d_src, n^d_tgt)
+        # bond color:
+        # blu -> 0
+        # red -> 1
+        # gre -> 2
+        # yel -> 3
+        energy_tgt_g_r = energy_src_tgt[:,2].unsqueeze(-2) + energy_src_tgt[:,1].unsqueeze(-3) # (..., n^d_src, n^d_src, n^d_tgt) direction: src -> green -> tgt -> red -> src
+        energy_g_r = torch.exp(-energy_tgt_g_r).sum(-1).log() # (..., n^d_src, n^d_src) marginalize tgt
+        energy_tgt_y_g = energy_src_tgt[:,3].unsqueeze(-2) + energy_src_tgt[:,2].unsqueeze(-3) # (..., n^d_src, n^d_src, n^d_tgt) direction: src -> yellow -> tgt -> green -> src
+        energy_y_g = torch.exp(-energy_tgt_y_g).sum(-1).log() # (..., n^d_src, n^d_src) marginalize tgt
+        energy_tgt_b_y = energy_src_tgt[:,0].unsqueeze(-2) + energy_src_tgt[:,3].unsqueeze(-3) # (..., n^d_src, n^d_src, n^d_tgt) direction: src -> blue -> tgt -> yellow -> src
+        energy_b_y = torch.exp(-energy_tgt_b_y).sum(-1).log() # (..., n^d_src, n^d_src) marginalize tgt
+        energy_tgt_r_b = energy_src_tgt[:,1].unsqueeze(-2) + energy_src_tgt[:,0].unsqueeze(-3) # (..., n^d_src, n^d_src, n^d_tgt) direction: src -> red -> tgt -> blue -> src
+        energy_r_b = torch.exp(-energy_tgt_r_b).sum(-1).log() # (..., n^d_src, n^d_src) marginalize tgt
+        N = self.bond.n**self.bond.d_src
+        energy_src0src1 = energy_g_r.view(-1, N, N, 1, 1)                 # [src0, src1, 1, 1]
+        energy_src1src2 = energy_y_g.view(-1, 1, N, N, 1)                 # [1, src1, src2, 1]
+        energy_src2src3 = energy_b_y.view(-1, 1, 1, N, N)                 # [1, 1, src2, src3]
+        energy_src3src0 = energy_r_b.permute(0,2,1).view(-1, N, 1, 1, N)  # [src0, 1, 1, src3]
+        energy = energy_src0src1 + energy_src1src2 + energy_src2src3 + energy_src3src0 # (..., n^d_src, n^d_src, n^d_src, n^d_src)
+        prob_src = torch.exp(-energy)
+        prob_src = prob_src/prob_src.sum((1,2,3,4), keepdim=True) # (..., n^d_src, n^d_src, n^d_src, n^d_src)
+        if not split:
+            prob_src = prob_src.view(prob_src.shape[0], -1) # (..., n^Ld_src)
+        return prob_src
+    
 def Tvals(T, power=1):
     ''' compute transfer matrix eigenvalues '''
     assert max(T.shape[-4:])**power <= 1024, f'power={power} is too large.'
@@ -316,10 +441,10 @@ def Tvals(T, power=1):
     vals = torch.linalg.eigvalsh(MM).abs()
     return vals
 
-def GSD(T):
-    ''' compute ground state degeneracy '''
-    lamXi = torch.einsum(T, [...,0,1,0,1], [...])
-    lam2Xi = torch.einsum(T, [...,0,1,2,1], T, [...,2,3,0,3], [...])
+def Rank(T):
+    ''' compute rank of tensors (eg. prob_src/prob_tgt) '''
+    lamXi = torch.einsum('bijij->b', T)
+    lam2Xi = torch.einsum('bijkj,bklil->b', T, T)
     return lamXi**2/lam2Xi
 
 class RGMonotone(torch.nn.Module):
