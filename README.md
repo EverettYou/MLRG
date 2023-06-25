@@ -1,5 +1,4 @@
-# MLRG
-Machine Learning Renormalization Group
+# Machine Learning Renormalization Group
 
 Related paper: https://arxiv.org/abs/2306.11054
 
